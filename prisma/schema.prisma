@@ -1,0 +1,195 @@
+// Data model for the NFL postseason tournament app.
+// Postgres (Supabase/Neon free tier) — see the deployment guide for setup.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String         @id @default(cuid())
+  name          String         @unique
+  createdAt     DateTime       @default(now())
+  survivorPicks SurvivorPick[]
+  atsPicks      AtsPick[]
+  ouPicks       OuPick[]
+  salamiPicks   SalamiPick[]
+  superBowlPick SuperBowlPick?
+  dkScores      DkScore[]
+}
+
+model Team {
+  id          String       @id // short code, e.g. "buf"
+  name        String
+  color       String
+  players     Player[]
+  kickerStats KickerStat[]
+}
+
+model Player {
+  id            String         @id @default(cuid())
+  name          String
+  pos           String // QB | RB | WR | TE
+  teamId        String
+  team          Team           @relation(fields: [teamId], references: [id])
+  dkPoints      Float          @default(0) // set by the stats-feed sync job each round
+  survivorPicks SurvivorPick[]
+}
+
+// One row per playoff round (Wild Card, Divisional, Conference, Super Bowl).
+// teamIds / positionMix are JSON-encoded strings (SQLite has no native JSON column).
+model Round {
+  id          String   @id // wc | div | conf | sb
+  label       String
+  order       Int
+  multiplier  Float
+  lockTime    DateTime
+  teamIds     String // JSON string[]
+  positionMix String // JSON { pos: string, count: number }[]
+  slots       Slot[]
+}
+
+// A single roster seat for a round, e.g. "QB #1" or "KICK".
+model Slot {
+  id       String         @id @default(cuid())
+  roundId  String
+  round    Round          @relation(fields: [roundId], references: [id])
+  position String
+  index    Int
+  picks    SurvivorPick[]
+
+  @@unique([roundId, position, index])
+}
+
+// Actual kicking box-score inputs per team per round, used to compute kicker points.
+model KickerStat {
+  id         String  @id @default(cuid())
+  teamId     String
+  team       Team    @relation(fields: [teamId], references: [id])
+  roundId    String
+  fgMade     String // JSON number[] (made FG yardages)
+  fgMissed   String // JSON number[] (missed FG yardages)
+  patMade    Int     @default(0)
+  patFailed  Int     @default(0)
+  longest    Boolean @default(false) // held the round's longest FG
+  gameWinner Boolean @default(false) // hit a game-winning FG
+
+  @@unique([teamId, roundId])
+}
+
+// One participant's pick for one slot in one round.
+// Either playerId (skill slots) or kickTeamId (KICK slot) is set, not both.
+model SurvivorPick {
+  id         String  @id @default(cuid())
+  userId     String
+  user       User    @relation(fields: [userId], references: [id])
+  slotId     String
+  slot       Slot    @relation(fields: [slotId], references: [id])
+  playerId   String?
+  player     Player? @relation(fields: [playerId], references: [id])
+  kickTeamId String?
+
+  @@unique([userId, slotId])
+}
+
+// ---------------------------------------------------------------------------
+// Pick'em contests (ATS, Over/Under, Grand Salami, Super Bowl winner)
+// ---------------------------------------------------------------------------
+
+// A group of games, e.g. "Wild Card". Also carries the Grand Salami line.
+model Slate {
+  id          String       @id // wc | div | conf | sb
+  label       String
+  order       Int
+  salamiLine  Float? // over/under on the combined score of every game in the slate
+  games       Game[]
+  salamiPicks SalamiPick[]
+}
+
+model Game {
+  id         String    @id @default(cuid())
+  slateId    String
+  slate      Slate     @relation(fields: [slateId], references: [id], onDelete: Cascade)
+  awayTeam   String
+  homeTeam   String
+  kickoff    DateTime
+  homeSpread Float // negative = home team is favored (e.g. -3.5)
+  total      Float // over/under line
+  awayScore  Int?
+  homeScore  Int?
+  isFinal    Boolean   @default(false)
+  atsPicks   AtsPick[]
+  ouPicks    OuPick[]
+}
+
+model AtsPick {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  gameId String
+  game   Game   @relation(fields: [gameId], references: [id], onDelete: Cascade)
+  side   String // "away" | "home"
+
+  @@unique([userId, gameId])
+}
+
+model OuPick {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  gameId String
+  game   Game   @relation(fields: [gameId], references: [id], onDelete: Cascade)
+  side   String // "over" | "under"
+
+  @@unique([userId, gameId])
+}
+
+model SalamiPick {
+  id      String @id @default(cuid())
+  userId  String
+  user    User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  slateId String
+  slate   Slate  @relation(fields: [slateId], references: [id], onDelete: Cascade)
+  side    String // "over" | "under"
+
+  @@unique([userId, slateId])
+}
+
+model SuperBowlPick {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  team   String
+}
+
+// Simple key/value settings: "playoffTeams" (one team per line), "superBowlWinner".
+model Setting {
+  key   String @id
+  value String
+}
+
+// ---------------------------------------------------------------------------
+// DK Slates: real DraftKings contest scores, typed in by the commissioner.
+// ---------------------------------------------------------------------------
+
+model DkSlate {
+  id        String    @id @default(cuid())
+  label     String // e.g. "Wild Card Saturday"
+  createdAt DateTime  @default(now())
+  scores    DkScore[]
+}
+
+model DkScore {
+  id      String  @id @default(cuid())
+  slateId String
+  slate   DkSlate @relation(fields: [slateId], references: [id], onDelete: Cascade)
+  userId  String
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  points  Float
+
+  @@unique([slateId, userId])
+}
